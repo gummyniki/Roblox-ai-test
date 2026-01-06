@@ -15,9 +15,10 @@ local combat = {}
 
 StateMachine.__index = StateMachine
 
-function StateMachine.new(initialState)
+function StateMachine.new(initialState, selfAI)
 	return setmetatable({
 		current = initialState,
+		ai = selfAI,
 		previous = nil,
 		states = {}
 	}, StateMachine)
@@ -33,6 +34,10 @@ end
 
 
 function StateMachine:Change(newState)
+	if self.ai.flags.jumpscaring and newState ~= "Jumpscare" then
+		return
+	end
+	
 	if self.current == newState then return end
 
 	local oldState = self.current
@@ -258,7 +263,7 @@ function baseAI.new(character, config)
 	self.root = character:WaitForChild("HumanoidRootPart")
 	self.animator = self.humanoid:FindFirstChild("Animator")
 
-	self.state = StateMachine.new("Idle")
+	self.state = StateMachine.new("Idle", self)
 
 	self.config = config
 	self.target = nil
@@ -271,6 +276,8 @@ function baseAI.new(character, config)
 		stunned = false,
 		jumpscaring = false
 	}
+	
+	self.state.ai = self
 
 	return self
 end
@@ -339,8 +346,18 @@ function States.BaseWander(ai, options)
 
 	return {
 		Enter = function()
+			if ai.flags.jumpscaring then return end
 			if not ai.canMove then return end
 			ai.humanoid.WalkSpeed = ai.config.walkingSpeed
+			
+			ai.isWandering = false
+			ai.finishedWander = false
+
+			if ai.moveConnection then
+				ai.moveConnection:Disconnect()
+				ai.moveConnection = nil
+			end
+			
 			pathing.moveToRandomPoint(ai, false)
 		end,
 
@@ -379,11 +396,13 @@ function States.BaseChase(ai, options)
 	return {
 		Enter = function()
 			if not ai.canMove then return end
+			if ai.flags.jumpscaring then return end 
 			ai.humanoid.WalkSpeed = ai.config.runningSpeed
 			chasePlayerEvent:FireClient(game.Players:GetPlayerFromCharacter(ai.target), ai.root, enemy)
 		end,	
 
 		Update = function(dt)
+			if ai.flags.jumpscaring then return end
 			if not ai.canMove then return end
 			if not ai.target then 
 				ai.state:Change("Wander")
@@ -398,12 +417,19 @@ function States.BaseChase(ai, options)
 
 
 			local root = ai.root
-			local targetRoot = ai.target:FindFirstChild("HumanoidRootPart")
+			local target = ai.target
+			
+			if not target then
+				ai.state:Change("Wander")
+				return
+			end
 
+			local targetRoot = target:FindFirstChild("HumanoidRootPart")
 			if not targetRoot then
 				ai.state:Change("Wander")
 				return
 			end
+
 
 			local distance = (root.Position - targetRoot.Position).Magnitude
 
@@ -421,52 +447,16 @@ function States.BaseChase(ai, options)
 
 
 			if target then
-				stoppedChasePlayerEvent:FireClient(game.Players:GetPlayerFromCharacter(target))
+				local player = game.Players:GetPlayerFromCharacter(target)
+				if player then
+					stoppedChasePlayerEvent:FireClient(player)
+				end
+
 			end
 		end
 
 	}
 
-end
-
-function States.Idle(ai)
-	return {
-		Enter = function() end,
-		Update = function() end,
-		Exit = function() end
-	}
-end
-
-function States.BaseStun(ai)
-	return {
-		Enter = function()
-			if ai.flags.stunned then return end
-			ai.flags.stunned = true
-
-			ai.humanoid.WalkSpeed = 0
-
-			local intro = ai.animations.StunIntro
-			local loop = ai.animations.StunLoop
-			local exit = ai.animations.StunExit
-
-			intro:Play(0.15)
-
-			intro.Ended:Once(function()
-				loop:Play(0.15)
-
-				task.delay(ai.config.StunDuration, function()
-					exit:Play(0.15)
-					loop:Stop(0.15)
-
-					exit.Ended:Once(function()
-						ai.flags.stunned = false
-						ai.humanoid.WalkSpeed = ai.config.walkingSpeed
-						ai.state:Change("Wander")
-					end)
-				end)
-			end)
-		end
-	}
 end
 
 function States.BaseJumpscare(ai, options)
@@ -480,6 +470,17 @@ function States.BaseJumpscare(ai, options)
 
 	return {
 		Enter = function()
+			print("entered jumpscare")
+			ai.canMove = false
+			ai:StopMovement()
+			
+			local root = ai.root
+
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root:SetNetworkOwner(nil)
+
+
 			if ai.flags.jumpscaring then return end
 			ai.flags.jumpscaring = true
 
@@ -521,9 +522,22 @@ function States.BaseJumpscare(ai, options)
 
 			ai.animations[enemyAnim].Ended:Once(function()
 				ai.flags.jumpscaring = false
+				ai.Target = nil
+				ai.canMove = true
+				root.Anchored = false
+				root:SetNetworkOwner(nil)
+				
+				task.wait(0.5)
 				ai.state:Change("Wander")
 			end)
-		end
+		end,
+		
+		Exit = function()
+			ai.flags.jumpscaring = false
+			ai.canMove = true
+			ai:StopMovement()
+		end,
+
 	}
 end
 
@@ -558,7 +572,7 @@ function ZombieAI.New(character : Model, debugging : boolean)
 		HitCooldown = 2,
 		StunDuration = 3,
 	}
-	
+
 	local ai = baseAI.new(character, config)
 	setmetatable(ai, ZombieAI)
 
@@ -566,7 +580,7 @@ function ZombieAI.New(character : Model, debugging : boolean)
 	ai.character = character
 	ai.debugging = debugging
 	ai.canMove = true
-	ai.state = StateMachine.new("Wander")
+	ai.state = StateMachine.new("Wander", ai)
 	ai.lastSeenTime = 0
 	ai.loseTargetDelay = 2
 	ai.canHit = true
@@ -575,12 +589,12 @@ function ZombieAI.New(character : Model, debugging : boolean)
 	ai.finishedWander = false
 	ai.moveConnection = nil
 	ai.playingChaseTheme = false
-	
+
 	function ai:Attack()
 		ai.lastAttackTime = os.clock()
 		local targetHumanoid = ai.target:FindFirstChild("Humanoid")
 		local targetHRP = ai.target:FindFirstChild("HumanoidRootPart")
-		
+
 		if targetHumanoid.Health - ai.config.Damage <= 0 then
 			ai.state:Change("Jumpscare")
 		else
@@ -588,12 +602,12 @@ function ZombieAI.New(character : Model, debugging : boolean)
 			events.HitPlayer:FireClient(Players:GetPlayerFromCharacter(ai.target))
 			ai.animations["Hit"]:Play()
 		end
-		
-		
-		
+
+
+
 	end
-	
-	
+
+
 	ai:RegisterAnimation("StunIntro", script.StunEnterAnim, false)
 	ai:RegisterAnimation("StunLoop", script.StunLoopAnim, true)
 	ai:RegisterAnimation("StunExit", script.StunExitAnim, false)
@@ -601,12 +615,11 @@ function ZombieAI.New(character : Model, debugging : boolean)
 
 	ai:RegisterAnimation("Kill", script.KillAnim, false)
 
-	
-	
+
+
 	ai.state:AddState("Wander", States.BaseWander(ai))
 	ai.state:AddState("Chase", States.BaseChase(ai))
-	
-	ai.state:AddState("Stunned", States.BaseStun(ai))
+
 	ai.state:AddState("Jumpscare", States.BaseJumpscare(ai, {
 		Type = "Zombie",
 		playEvent = jumpscareEvents.PlayJumpscare,
@@ -615,8 +628,8 @@ function ZombieAI.New(character : Model, debugging : boolean)
 		EnemyAnim = "Kill",
 		Impulse = Vector3.new(-100, 0, 100)
 	}))
-	
-	
+
+
 	setmetatable(ai, ZombieAI)
 	return ai
 end
@@ -624,10 +637,10 @@ end
 
 function ZombieAI:BeginPathing()
 	local humanoid : Humanoid = self.character:WaitForChild("Humanoid")
-	
+
 	humanoid.WalkSpeed = self.config.walkingSpeed
-	
-	
+
+
 	local last = os.clock()
 
 	while task.wait() do
@@ -637,8 +650,8 @@ function ZombieAI:BeginPathing()
 
 		self.state:Update(dt)
 	end
-	
-	
+
+
 end
 
 
