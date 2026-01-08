@@ -1,3 +1,16 @@
+--[[
+	Zombie AI
+	---------
+	Features:
+		- Wander / Chase / Jumpscare states
+		- Custom State Machine for zombie behavior
+		- Hearing / Seeing system using magnitude and raycasting
+		- Chase Music
+		- Fully Modularized
+]]
+
+
+
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local PathfindingService = game:GetService("PathfindingService")
 local tweenService = game:GetService("TweenService")
@@ -13,8 +26,12 @@ local combat = {}
 -- State Machine
 ---------------------------------------------
 
+-- StateMachine
+-- Simple state machine with enter/update/exit loops
+-- Supports hard-locks (e.g. jumpscare) to prevent invalid state transitions
 StateMachine.__index = StateMachine
 
+-- Simple metatable creation for the state machine
 function StateMachine.new(initialState, selfAI)
 	return setmetatable({
 		current = initialState,
@@ -24,15 +41,19 @@ function StateMachine.new(initialState, selfAI)
 	}, StateMachine)
 end
 
+-- Adds a state to the state machine
 function StateMachine:AddState(name, state)
 	self.states[name] = state
 end
 
+-- Simply returns the current state property
 function StateMachine:Get()
 	return self.current
 end
 
-
+-- Handles changing between states
+-- Makes sure to exit the old state and enter the new one as to not cause logic issues
+-- Has a hard lock for jumpscaring
 function StateMachine:Change(newState)
 	if self.ai.flags.jumpscaring and newState ~= "Jumpscare" then
 		return
@@ -43,19 +64,18 @@ function StateMachine:Change(newState)
 	local oldState = self.current
 	self.previous = oldState
 
-	-- exit old state
 	if oldState and self.states[oldState] and self.states[oldState].Exit then
 		self.states[oldState].Exit()
 	end
 
 	self.current = newState
 
-	-- enter new state
 	if self.states[newState] and self.states[newState].Enter then
 		self.states[newState].Enter()
 	end
 end
 
+-- Forwards dt to the current state's update loop
 function StateMachine:Update(dt)
 	local state = self.states[self.current]
 	if state and state.Update then
@@ -67,6 +87,8 @@ end
 -- Pathing
 --------------------------------------------
 
+-- Helper function for following a specified target using pathfinding
+-- It handles character jumping, as well as recalculating pathfinding every time the ai moves a bit as to always be chasing the current target position
 function pathing.FollowTarget(ai, destination)
 	local path = PathfindingService:FindPathAsync(ai.root.Position, destination)
 	local currentPointIndex = 1
@@ -98,7 +120,7 @@ function pathing.FollowTarget(ai, destination)
 	end
 end
 
-
+-- Helper function to check if the ai can see the target using raycasting
 function pathing.hasLineOfSight(from, to, targetCharacter, ignore)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -115,7 +137,7 @@ function pathing.hasLineOfSight(from, to, targetCharacter, ignore)
 	return result.Instance:IsDescendantOf(targetCharacter)
 end
 
-
+-- Runs a magnitude check on every player to check if one is close enough to the ai
 function pathing.getNearestPlayer(character: Model, maxRange: number)
 	local root = character:FindFirstChild("HumanoidRootPart")
 	if not root then return nil end
@@ -144,7 +166,10 @@ function pathing.getNearestPlayer(character: Model, maxRange: number)
 	return closestCharacter
 end
 
-
+-- Moves the ai to a random position in an 100 stud radius using pathfinding
+-- Makes sure only one move connection is active at a time as to not cause logic issues
+-- Only works in the wander state
+-- Has optional path debugging
 function pathing.moveToRandomPoint(ai, debugging: boolean)
 	local humanoid = ai.character:FindFirstChild("Humanoid")
 	local root = ai.character:FindFirstChild("HumanoidRootPart")
@@ -219,39 +244,25 @@ end
 -- Combat
 ---------------------------------------------
 
+-- Casts a ray in front of the ai with the specified range and returns the result
 function combat.RaycastHit(ai, range)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = { ai.character }
 
-	local result = workspace:Raycast(
-		ai.root.Position,
-		ai.root.CFrame.LookVector * range,
-		params
-	)
+	local result = workspace:Raycast(ai.root.Position, ai.root.CFrame.LookVector * range, params)
+	
 
 	return result
-end
-
-function combat.BlockCastPart(part : BasePart, size : Vector3, offset : Vector3, params : RaycastParams)
-	local baseParams = RaycastParams.new()
-	baseParams.FilterType = Enum.RaycastFilterType.Exclude
-	baseParams.FilterDescendantsInstances = {part}
-
-	params = params or baseParams
-	size = size or Vector3.new(1, 1, 1)
-	offset = offset or Vector3.new(0, 0, 0)
-	local blockcast = workspace:Blockcast(part.CFrame + offset, size, part.CFrame.LookVector, params)
-
-
-	return blockcast
-
-
 end
 
 ---------------------------------------------
 -- Base AI
 ---------------------------------------------
+
+-- BaseAI
+-- Handles Core AI mechanics such as state machine creation and animations
+-- Most functions should be self explanatory
 
 baseAI.__index = baseAI
 
@@ -286,6 +297,7 @@ function baseAI:CanAttack()
 	return os.clock() - self.lastAttackTime >= self.config.HitCooldown
 end
 
+-- Overriden later
 function baseAI:Attack()
 	self.lastAttackTime = os.clock()
 end
@@ -302,6 +314,7 @@ function baseAI:Update(dt)
 	self.state:Update(dt)
 end
 
+-- Disconnects the ai's move connection if it exists and cancells any MoveTo function
 function baseAI:StopMovement()
 	if self.moveConnection then
 		self.moveConnection:Disconnect()
@@ -311,6 +324,7 @@ function baseAI:StopMovement()
 	self.humanoid:Move(Vector3.zero)
 end
 
+-- Loads an animation object into the ai using it's humanoid and saves it into a dictionary
 function baseAI:RegisterAnimation(name, animation, looped)
 	local track = self.animator:LoadAnimation(animation)
 	track.Looped = looped
@@ -318,29 +332,19 @@ function baseAI:RegisterAnimation(name, animation, looped)
 	return track
 end
 
-function baseAI:InitCooldowns()
-	self.cooldowns = {}
-end
-
-function baseAI:SetCooldown(name, duration)
-	self.cooldowns[name] = os.clock() + duration
-end
-
-function baseAI:IsOnCooldown(name)
-	local t = self.cooldowns[name]
-	return t ~= nil and os.clock() < t
-end
-
-function baseAI:ClearCooldown(name)
-	self.cooldowns[name] = nil
-end
-
-
 ------------------------------------------------
 -- Zombie States
 ------------------------------------------------
 
+-- States
+-- Handles actual zombie logic
+-- Uses Enter(), Update() and Exit() functions
 
+-- Wander state
+-- Makes sure the ai can move and isn't jumpscaring, as well as cancelling any move connection
+-- Uses the earlier defined Pathing helpers
+-- Checks for players inside it's hearing radius and makes sure the zombie can see them
+-- If it finds a player then it changes to the Chase state
 function States.BaseWander(ai, options)
 	options = options or {}
 
@@ -386,6 +390,11 @@ function States.BaseWander(ai, options)
 	}
 end
 
+-- Chase state
+-- Handles chasing the nearest player using the Pathing helper
+-- Fires client events for effects like vignette, fov change and chase music
+-- If close enough to the player, calls the ai's Attack() method
+-- If it loses the player, it transitions back to the wander state
 function States.BaseChase(ai, options)
 	options = options or {}
 	local enemy = options.Enemy or "Zombie"
@@ -459,6 +468,11 @@ function States.BaseChase(ai, options)
 
 end
 
+
+-- Jumpscare state
+-- Handles freezing the ai and player in place and playing their specified kill animations
+-- Turns on the state machine's hard lock as to make sure the jumpscare isn't cancelled
+
 function States.BaseJumpscare(ai, options)
 	options = options or {}
 
@@ -470,7 +484,6 @@ function States.BaseJumpscare(ai, options)
 
 	return {
 		Enter = function()
-			print("entered jumpscare")
 			ai.canMove = false
 			ai:StopMovement()
 			
@@ -522,7 +535,7 @@ function States.BaseJumpscare(ai, options)
 
 			ai.animations[enemyAnim].Ended:Once(function()
 				ai.flags.jumpscaring = false
-				ai.Target = nil
+				ai.target = nil
 				ai.canMove = true
 				root.Anchored = false
 				root:SetNetworkOwner(nil)
@@ -542,7 +555,10 @@ function States.BaseJumpscare(ai, options)
 end
 
 
-
+-- ZombieAI
+-- The actual ai creation
+-- Inherits from BaseAI
+-- Adds the required states and overrides the original ai:Attack()
 
 ZombieAI.__index = ZombieAI
 setmetatable(ZombieAI, baseAI)
@@ -553,6 +569,7 @@ local events = replicatedStorage:WaitForChild("Events"):WaitForChild("Zombie")
 local jumpscareEvents = replicatedStorage:WaitForChild("Events"):WaitForChild("Jumpscares")
 local effectEvents = replicatedStorage:WaitForChild("Events"):WaitForChild("Effects")
 
+-- Custom type for the zombie configuration
 export type ZombieConfig = {
 	Damage : number,
 	HearingRange : number,
@@ -562,7 +579,7 @@ export type ZombieConfig = {
 	StunDuration : number
 }
 
-
+-- ZombieAI constructor
 function ZombieAI.New(character : Model, debugging : boolean)
 	local config : ZombieConfig = {
 		Damage = 25,
@@ -589,7 +606,9 @@ function ZombieAI.New(character : Model, debugging : boolean)
 	ai.finishedWander = false
 	ai.moveConnection = nil
 	ai.playingChaseTheme = false
-
+	
+	-- Custom attack function for the zombie
+	-- Handles damaging the player and changing to the jumpscare state if the hit is lethal
 	function ai:Attack()
 		ai.lastAttackTime = os.clock()
 		local targetHumanoid = ai.target:FindFirstChild("Humanoid")
@@ -634,7 +653,7 @@ function ZombieAI.New(character : Model, debugging : boolean)
 	return ai
 end
 
-
+-- Starts the zombie ai by calling the state machine's Update() method uisng deltatime
 function ZombieAI:BeginPathing()
 	local humanoid : Humanoid = self.character:WaitForChild("Humanoid")
 
@@ -658,6 +677,13 @@ end
 --------------------------------------------
 -- Event Handler
 --------------------------------------------
+
+--[[
+	InitializeEvents
+	- Must be called on the client
+	- Initializes all remote events required for the zombie
+	- Handles client effects like screen shaking, vignette, fov change and chase music
+]]
 
 function ZombieAI.InitializeEvents()
 	-- cameraShaker is an external library used for camera shaking
